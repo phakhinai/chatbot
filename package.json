@@ -1,0 +1,22 @@
+{
+  "name": "rag-chatbot",
+  "private": true,
+  "packageManager": "pnpm@12.15.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"./apps/*\" dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "infra:up": "docker compose --env-file .env -f infra/compose.dev.yml up -d --wait",
+    "infra:down": "docker compose --env-file .env -f infra/compose.dev.yml down",
+    "infra:status": "docker compose --env-file .env -f infra/compose.dev.yml ps",
+    "test:smoke": "node --env-file=.env scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "~5.9.3",
+    "@types/node": "^24.0.0"
+  }
+}

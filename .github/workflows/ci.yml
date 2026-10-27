@@ -1,0 +1,102 @@
+name: Test Build Deploy
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  verify:
+    name: Typecheck, build, integration test and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      api_image: ${{ steps.publish.outputs.api_image }}
+      web_image: ${{ steps.publish.outputs.web_image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Install pinned package manager and dependencies
+        run: |
+          npm install --global pnpm@12.15.0
+          pnpm install --frozen-lockfile
+      - name: Test types and shell syntax
+        run: |
+          pnpm typecheck
+          for script in scripts/deploy/*.sh; do bash -n "$script"; done
+      - name: Build production images
+        run: |
+          docker build -f apps/api/Dockerfile -t rag-chatbot-api:rehearsal .
+          docker build -f apps/web/Dockerfile -t rag-chatbot-web:rehearsal .
+      - name: Start isolated production stack
+        run: |
+          node scripts/prepare-rehearsal.mjs
+          docker compose --env-file .rehearsal/production.env -f infra/compose.prod.yml up -d --wait --wait-timeout 180
+      - name: Integration test through reverse proxy
+        run: bash scripts/deploy/verify.sh .rehearsal/production.env
+      - name: Backup and restore drill
+        run: |
+          bash scripts/deploy/backup.sh .rehearsal/production.env
+          archive=$(find .rehearsal/backups -name postgres.dump -type f | sort | tail -1)
+          bash scripts/deploy/restore-check.sh .rehearsal/production.env "$archive"
+      - name: Publish tested images by commit and digest
+        id: publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo=${GITHUB_REPOSITORY,,}
+          api="ghcr.io/$repo-api:$GITHUB_SHA"
+          web="ghcr.io/$repo-web:$GITHUB_SHA"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag rag-chatbot-api:rehearsal "$api"
+          docker tag rag-chatbot-web:rehearsal "$web"
+          docker push "$api"
+          docker push "$web"
+          printf 'api_image=%s\n' "$(docker image inspect "$api" --format '{{index .RepoDigests 0}}')" >> "$GITHUB_OUTPUT"
+          printf 'web_image=%s\n' "$(docker image inspect "$web" --format '{{index .RepoDigests 0}}')" >> "$GITHUB_OUTPUT"
+      - name: Container status on failure
+        if: failure()
+        run: docker compose --env-file .rehearsal/production.env -f infra/compose.prod.yml ps --all
+      - name: Stop CI containers, preserve volumes until runner cleanup
+        if: always()
+        run: |
+          if [ -f .rehearsal/production.env ]; then
+            docker compose --env-file .rehearsal/production.env -f infra/compose.prod.yml down
+          fi
+  deploy:
+    name: Deploy immutable images to VPS
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ENABLE_VPS_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Deploy release over verified SSH connection
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          API_IMAGE: ${{ needs.verify.outputs.api_image }}
+          WEB_IMAGE: ${{ needs.verify.outputs.web_image }}
+        run: bash scripts/deploy/ssh-release.sh
